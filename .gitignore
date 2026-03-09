@@ -1,6 +1,13 @@
 # Environment & secrets
 .env
 
+# Data logs (snapshots, alerts)
+data/
+analyze/data/
+analyze/output/
+analyze/.cache/
+analyze/.mplconfig/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -20,3 +27,4 @@ Thumbs.db
 .claude/
 CLAUDE.md
 tasks/
+hooks/

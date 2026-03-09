@@ -7,15 +7,18 @@ Scrapes the Exponent Finance page for dehydrated React Query state which
 contains every market, then delivers dashboards, percentage-change alerts,
 and three always-on default alerts:
   a) New market listed
-  b) Any market PT/YT price changes >8%
+  b) Any market PT/YT price changes >20%
   c) Any LP pool filled >80%
 """
 
+import csv
+import json
 import logging
 import os
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -34,6 +37,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+try:
+    from ratex_scraper import fetch_ratex_markets
+except Exception as exc:
+    logger.warning("Rate-X scraper unavailable: %s", exc)
+
+    def fetch_ratex_markets() -> list[dict]:
+        return []
+
+try:
+    from spread_signal import evaluate_signals, get_alertable_signals, format_signal_alert, format_signal_summary
+except Exception as exc:
+    logger.warning("Spread signal module unavailable: %s", exc)
+    evaluate_signals = None
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -45,8 +62,141 @@ DEFAULT_INTERVAL_SECONDS = 600  # 10 minutes
 TICK_INTERVAL_SECONDS = 60
 
 # Default alert thresholds
-PCT_CHANGE_THRESHOLD = 0.08  # 8%
+PCT_CHANGE_THRESHOLD = 0.20  # 20%
 POOL_FILL_THRESHOLD = 0.80  # 80%
+
+# ── Data logging ─────────────────────────────────────────────────────────────
+
+DATA_DIR = Path("data")
+SNAPSHOTS_DIR = DATA_DIR / "snapshots"
+SNAPSHOTS_CSV = DATA_DIR / "snapshots.csv"
+ALERTS_CSV = DATA_DIR / "alerts.csv"
+SNAPSHOT_INTERVAL = 86400  # 24 hours
+
+DATA_DIR.mkdir(exist_ok=True)
+SNAPSHOTS_DIR.mkdir(exist_ok=True)
+
+last_snapshot_ts: float = 0.0
+
+SNAPSHOT_COLUMNS = [
+    "timestamp", "source", "address", "platform", "label", "underlying_symbol", "maturity_ts",
+    "pt_price", "pt_price_usd", "implied_apy", "pt_implied_apy", "underlying_yield",
+    "lp_price", "lp_fees_apy", "tvl_usd", "pool_fill_pct", "pool_cap_usd",
+    "base_asset_usd", "sol_price_usd",
+]
+
+ALERT_COLUMNS = ["timestamp", "alert_type", "source", "market_address", "label", "detail"]
+
+
+# Canonical platform names — merges aliases from both Exponent and Rate-X
+# so markets for the same project group together in the dashboard.
+_PLATFORM_ALIASES = {
+    "onrefinance": "onre",
+    "solv": "fragmetric",
+    "jito restaking": "fragmetric",
+}
+
+
+def _normalize_platform(platform: str) -> str:
+    return _PLATFORM_ALIASES.get(platform, platform)
+
+
+def _log_snapshot(markets: list[dict]) -> None:
+    """Append one row per market to snapshots.csv and save daily JSON."""
+    now = datetime.now(timezone.utc)
+    ts = now.isoformat()
+
+    # CSV snapshot
+    write_header = not SNAPSHOTS_CSV.exists()
+    with open(SNAPSHOTS_CSV, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SNAPSHOT_COLUMNS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        for m in markets:
+            row = {
+                "timestamp": ts,
+                "source": m.get("source", "exponent"),
+                "address": m.get("address"),
+                "platform": m.get("platform"),
+                "label": m.get("label"),
+                "underlying_symbol": m.get("underlying_symbol"),
+                "maturity_ts": m.get("maturity_ts"),
+                "pt_price": m.get("pt_price"),
+                "pt_price_usd": m.get("pt_price_usd"),
+                "implied_apy": m.get("implied_apy"),
+                "pt_implied_apy": m.get("pt_implied_apy"),
+                "underlying_yield": m.get("underlying_yield"),
+                "lp_price": m.get("lp_price"),
+                "lp_fees_apy": m.get("lp_fees_apy"),
+                "tvl_usd": m.get("tvl_usd"),
+                "pool_fill_pct": m.get("pool_fill_pct"),
+                "pool_cap_usd": m.get("pool_cap_usd"),
+                "base_asset_usd": m.get("base_asset_usd"),
+                "sol_price_usd": m.get("sol_price_usd"),
+            }
+            writer.writerow(row)
+
+    # Daily JSON snapshot
+    json_path = SNAPSHOTS_DIR / f"{now.strftime('%Y-%m-%d')}.json"
+    with open(json_path, "w") as f:
+        json.dump(markets, f, indent=2, default=str)
+
+    logger.info("Snapshot logged: %d markets → %s + %s", len(markets), SNAPSHOTS_CSV, json_path)
+
+
+def _log_alert(
+    alert_type: str,
+    address: str | None,
+    label: str | None,
+    detail: str,
+    source: str | None = None,
+) -> None:
+    """Append one row to alerts.csv."""
+    ts = datetime.now(timezone.utc).isoformat()
+    write_header = not ALERTS_CSV.exists()
+    with open(ALERTS_CSV, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=ALERT_COLUMNS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": ts,
+            "alert_type": alert_type,
+            "source": source or "",
+            "market_address": address or "",
+            "label": label or "",
+            "detail": detail,
+        })
+
+
+def _load_latest_snapshot_markets() -> tuple[list[dict], Path | None]:
+    """Load latest saved snapshot markets from disk as a fallback."""
+    snapshot_files = sorted(SNAPSHOTS_DIR.glob("*.json"))
+    if not snapshot_files:
+        return [], None
+
+    latest_path = snapshot_files[-1]
+    try:
+        with open(latest_path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read snapshot %s: %s", latest_path, exc)
+        return [], None
+
+    if not isinstance(payload, list):
+        return [], latest_path
+
+    markets: list[dict] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("address"):
+            continue
+        # Backward compatibility for older snapshots.
+        row.setdefault("source", "exponent")
+        markets.append(row)
+
+    return markets, latest_path
+
 
 # ── Scraper ──────────────────────────────────────────────────────────────────
 
@@ -154,7 +304,7 @@ def _extract_market_fields(
     if not address or len(address) < 20:
         return None
 
-    platform = _find_str("platform")
+    platform = _normalize_platform(_find_str("platform") or "unknown")
     maturity_ts = _find_int("maturityDateUnixTs") or _find_int("maturityUnixTs")
     decimals = _find_int("decimals") or 9
 
@@ -229,6 +379,7 @@ def _extract_market_fields(
         pool_cap_usd = tvl_usd / pool_fill_pct
 
     return {
+        "source": "exponent",
         "address": address,
         "platform": platform,
         "maturity_ts": maturity_ts,
@@ -288,8 +439,13 @@ def fetch_all_markets() -> list[dict]:
     if not all_markets:
         all_markets = _parse_all_markets_fallback(html, sol_price_usd, token_map)
 
-    # Filter out expired markets
-    markets = [m for m in all_markets if not m.get("expired")]
+    # Manually delisted markets (gone from Exponent UI but still in HTML)
+    _DELISTED = {
+        "EbQERtzZyMscG4vQcEvZr9qrH856bKcgNo9Dtjcqff9S",  # jupiter · JLP · 8Mar26
+    }
+
+    # Filter out expired and delisted markets
+    markets = [m for m in all_markets if not m.get("expired") and m.get("address") not in _DELISTED]
 
     logger.info("Parsed %d active markets (%d expired filtered out)",
                 len(markets), len(all_markets) - len(markets))
@@ -351,6 +507,27 @@ def _parse_all_markets_fallback(
 # ── Formatting ───────────────────────────────────────────────────────────────
 
 
+TELEGRAM_TEXT_LIMIT = 3900
+
+
+def _source_code(source: str | None) -> str:
+    return "RTX" if (source or "").lower() == "ratex" else "EXP"
+
+
+def _source_tag(source: str | None) -> str:
+    return f"[{_source_code(source)}]"
+
+
+def _market_key(market: dict) -> tuple[str, str]:
+    source = (market.get("source") or "exponent").lower()
+    address = str(market.get("address") or "")
+    return source, address
+
+
+def _market_display_label(market: dict) -> str:
+    return f"{market.get('label', '?')} {_source_tag(market.get('source'))}"
+
+
 def _fmt_usd(val: float) -> str:
     """Format a USD value compactly: $1.2B, $340M, $52K, $800."""
     if val >= 1_000_000_000:
@@ -360,6 +537,35 @@ def _fmt_usd(val: float) -> str:
     if val >= 1_000:
         return f"${val / 1_000:.0f}K"
     return f"${val:,.0f}"
+
+
+def _split_text_chunks(text: str, max_len: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split text into Telegram-safe chunks while preserving line boundaries."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    for line in text.splitlines(keepends=True):
+        if len(line) > max_len:
+            if current:
+                chunks.append(current.rstrip("\n"))
+                current = ""
+            for i in range(0, len(line), max_len):
+                chunks.append(line[i:i + max_len].rstrip("\n"))
+            continue
+
+        if len(current) + len(line) > max_len and current:
+            chunks.append(current.rstrip("\n"))
+            current = line
+        else:
+            current += line
+
+    if current:
+        chunks.append(current.rstrip("\n"))
+
+    return chunks
 
 
 def _pool_bar(fill: float | None) -> str:
@@ -393,10 +599,17 @@ def format_all_markets_dashboard(markets: list[dict]) -> str:
         return "No markets found."
 
     active = [m for m in markets if not m.get("expired")]
-    active.sort(key=lambda m: (m.get("platform") or "", m.get("maturity_ts") or 0))
+    active.sort(
+        key=lambda m: (
+            m.get("platform") or "",
+            m.get("maturity_ts") or 0,
+            _source_code(m.get("source")),
+            m.get("address") or "",
+        )
+    )
 
     lines = [
-        "\U0001f4ca ExponentFi Yield Monitor",
+        "\U0001f4ca Solana Yield Monitor",
         f"   {len(active)} active markets",
     ]
 
@@ -410,7 +623,7 @@ def format_all_markets_dashboard(markets: list[dict]) -> str:
             lines.append(f"\u2501\u2501\u2501 {platform.upper()} \u2501\u2501\u2501")
             current_platform = platform
 
-        label = m.get("label", "?")
+        label = _market_display_label(m)
         pt = m.get("pt_price")
         apy = m.get("implied_apy")
         pt_usd = m.get("pt_price_usd")
@@ -428,14 +641,17 @@ def format_all_markets_dashboard(markets: list[dict]) -> str:
         underlying = m.get("underlying_yield")
         yt_apy_str = f" \u00b7 {underlying * 100:.1f}% yield" if underlying is not None else ""
 
-        # Pool line
+        # Pool / TVL line
         pool = _pool_info(m)
+        tvl_usd = m.get("tvl_usd")
 
         lines.append(f"\u25b8 {label}")
         lines.append(f"   PT {pt_str}{pt_usd_str}{apy_str}")
         lines.append(f"   YT {yt_str}{yt_usd_str}{yt_apy_str}")
         if pool:
             lines.append(f"   Pool {pool}")
+        elif tvl_usd is not None:
+            lines.append(f"   TVL {_fmt_usd(tvl_usd)}")
 
     lines.append("")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -447,9 +663,10 @@ def format_all_markets_dashboard(markets: list[dict]) -> str:
 def format_market_detail(m: dict) -> str:
     """Format a single market's detailed view."""
     label = m.get("label", "?")
+    source = _source_tag(m.get("source"))
 
     lines = [
-        f"\u250f\u2501\u2501 {label}",
+        f"\u250f\u2501\u2501 {label} {source}",
         "\u2503",
     ]
 
@@ -497,8 +714,11 @@ def format_market_detail(m: dict) -> str:
         lines.append(f"\u2503  LP Fees     {lp_fees * 100:.2f}%")
 
     pool = _pool_info(m)
+    tvl_usd = m.get("tvl_usd")
     if pool:
         lines.append(f"\u2503  Pool        {pool}")
+    elif tvl_usd is not None:
+        lines.append(f"\u2503  TVL         {_fmt_usd(tvl_usd)}")
 
     lines.append("\u2503")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -510,9 +730,9 @@ def format_market_detail(m: dict) -> str:
 # ── Global state ─────────────────────────────────────────────────────────────
 # In-memory (resets on restart).
 
-all_markets_latest: dict[str, dict] = {}  # address -> market dict
-all_markets_previous: dict[str, dict] = {}  # previous fetch snapshot
-known_market_addresses: set[str] = set()  # for new-market detection
+all_markets_latest: dict[tuple[str, str], dict] = {}  # (source, address) -> market dict
+all_markets_previous: dict[tuple[str, str], dict] = {}  # previous fetch snapshot
+known_market_addresses: set[tuple[str, str]] = set()  # for new-market detection
 first_fetch_done: bool = False
 last_dashboard_sent: dict[int, float] = {}  # chat_id -> timestamp
 
@@ -531,25 +751,31 @@ def _update_market_state(markets: list[dict]) -> list[dict]:
     """
     Rotate latest->previous and detect new market addresses.
     Returns list of newly discovered markets.
+
+    known_market_addresses only grows — a transient scraper failure on one
+    source won't shrink it, so markets don't re-appear as "new" on the next
+    successful fetch.
     """
     global all_markets_latest, all_markets_previous, known_market_addresses, first_fetch_done
 
     all_markets_previous = dict(all_markets_latest)
 
-    new_snapshot = {}
+    new_snapshot: dict[tuple[str, str], dict] = {}
     for m in markets:
-        addr = m["address"]
-        new_snapshot[addr] = m
+        key = _market_key(m)
+        if key[1]:
+            new_snapshot[key] = m
     all_markets_latest = new_snapshot
 
     new_markets = []
     current_addresses = set(new_snapshot.keys())
     if first_fetch_done:
         newly_found = current_addresses - known_market_addresses
-        for addr in newly_found:
-            new_markets.append(new_snapshot[addr])
+        for key in newly_found:
+            new_markets.append(new_snapshot[key])
 
-    known_market_addresses = current_addresses
+    # Only grow the known set — never shrink it due to partial fetch failures
+    known_market_addresses = known_market_addresses | current_addresses
     first_fetch_done = True
 
     return new_markets
@@ -565,62 +791,84 @@ def _pct_change(old: float | None, new: float | None) -> float | None:
 # ── Alert detection ──────────────────────────────────────────────────────────
 
 
-def _detect_price_changes() -> list[str]:
-    """Detect markets where PT or YT price changed >8% since last fetch."""
+def _detect_price_changes() -> list[dict]:
+    """Detect markets where PT or YT price changed >8% since last fetch.
+
+    Returns list of dicts with keys: text, alert_type, address, label, detail.
+    """
     alerts = []
-    for addr, current in all_markets_latest.items():
-        prev = all_markets_previous.get(addr)
+    for key, current in all_markets_latest.items():
+        prev = all_markets_previous.get(key)
         if not prev:
             continue
 
-        label = current.get("label", addr[:8])
+        address = key[1]
+        source = key[0]
+        label = _market_display_label(current)
 
         pt_change = _pct_change(prev.get("pt_price"), current.get("pt_price"))
         if pt_change is not None and abs(pt_change) >= PCT_CHANGE_THRESHOLD:
             direction = "\U0001f53a" if pt_change > 0 else "\U0001f53b"
-            alerts.append(
+            text = (
                 f"{direction} PT price move \u2014 {label}\n"
                 f"   {prev['pt_price']:.4f} \u2192 {current['pt_price']:.4f} ({pt_change:+.1%})"
             )
+            alerts.append({
+                "text": text, "alert_type": "pt_price_move",
+                "source": source, "address": address, "label": label,
+                "detail": f"{prev['pt_price']:.4f} -> {current['pt_price']:.4f} ({pt_change:+.1%})",
+            })
 
         apy_change = _pct_change(prev.get("implied_apy"), current.get("implied_apy"))
         if apy_change is not None and abs(apy_change) >= PCT_CHANGE_THRESHOLD:
             direction = "\U0001f53a" if apy_change > 0 else "\U0001f53b"
             prev_apy = prev["implied_apy"] * 100
             cur_apy = current["implied_apy"] * 100
-            alerts.append(
+            text = (
                 f"{direction} Implied APY move \u2014 {label}\n"
                 f"   {prev_apy:.1f}% \u2192 {cur_apy:.1f}% ({apy_change:+.1%})"
             )
+            alerts.append({
+                "text": text, "alert_type": "apy_move",
+                "source": source, "address": address, "label": label,
+                "detail": f"{prev_apy:.1f}% -> {cur_apy:.1f}% ({apy_change:+.1%})",
+            })
 
     return alerts
 
 
-def _detect_pool_fills() -> list[str]:
-    """Detect markets where pool fill crossed above 80% (edge-triggered)."""
+def _detect_pool_fills() -> list[dict]:
+    """Detect markets where pool fill crossed above 80% (edge-triggered).
+
+    Returns list of dicts with keys: text, alert_type, address, label, detail.
+    """
     alerts = []
-    for addr, current in all_markets_latest.items():
+    for key, current in all_markets_latest.items():
         fill = current.get("pool_fill_pct")
         if fill is None or fill < POOL_FILL_THRESHOLD:
             continue
 
-        prev = all_markets_previous.get(addr)
+        prev = all_markets_previous.get(key)
         prev_fill = prev.get("pool_fill_pct") if prev else None
 
         if prev_fill is not None and prev_fill >= POOL_FILL_THRESHOLD:
             continue
 
-        label = current.get("label", addr[:8])
+        address = key[1]
+        source = key[0]
+        label = _market_display_label(current)
         pct = fill * 100
-        alerts.append(
-            f"\U0001f7e1 {label}\n"
-            f"  Pool filled to {pct:.1f}%"
-        )
+        text = f"\U0001f7e1 {label}\n  Pool filled to {pct:.1f}%"
+        alerts.append({
+            "text": text, "alert_type": "pool_fill",
+            "source": source, "address": address, "label": label,
+            "detail": f"Pool filled to {pct:.1f}%",
+        })
 
     return alerts
 
 
-def _check_user_alerts(markets_by_addr: dict[str, dict]) -> dict[int, list[str]]:
+def _check_user_alerts(markets_by_addr: dict[tuple[str, str], dict]) -> dict[int, list[str]]:
     """Check user-level percentage alerts. Returns {chat_id: [messages]}."""
     results: dict[int, list[str]] = {}
 
@@ -632,16 +880,21 @@ def _check_user_alerts(markets_by_addr: dict[str, dict]) -> dict[int, list[str]]
             pct_threshold = alert["pct"]
             market_filter = alert.get("market_filter")
 
-            for addr, current in markets_by_addr.items():
-                prev = all_markets_previous.get(addr)
+            for key, current in markets_by_addr.items():
+                prev = all_markets_previous.get(key)
                 if not prev:
                     continue
 
-                label = current.get("label", addr[:8])
+                source, addr = key
+                label = _market_display_label(current)
 
                 if market_filter:
                     filt = market_filter.lower()
-                    if filt not in label.lower() and filt not in addr.lower():
+                    if (
+                        filt not in label.lower()
+                        and filt not in addr.lower()
+                        and filt not in source.lower()
+                    ):
                         continue
 
                 pt_change = _pct_change(prev.get("pt_price"), current.get("pt_price"))
@@ -675,7 +928,8 @@ async def _broadcast(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
     for chat_id in targets:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
+            for chunk in _split_text_chunks(text):
+                await context.bot.send_message(chat_id=chat_id, text=chunk)
         except Exception as e:
             logger.warning("Failed to send to %s: %s", chat_id, e)
 
@@ -688,45 +942,105 @@ async def _global_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     Single global job running every 60s:
     1. Fetch all markets
     2. Update state, detect new markets
-    3. Fire default alerts (new market, 8% change, 80% pool)
-    4. Send periodic dashboards (respecting per-user interval)
-    5. Check user-level custom alerts
+    3. Fire default alerts (new market, 20% change, 80% pool)
+    4. Log daily snapshots + alert events
+    5. Send periodic dashboards (respecting per-user interval)
+    6. Check user-level custom alerts
     """
+    global last_snapshot_ts
     logger.info("Global tick starting")
 
-    markets = fetch_all_markets()
+    exponent_markets = fetch_all_markets()
+    sol_price = next((m.get("sol_price_usd") for m in exponent_markets if m.get("sol_price_usd")), None)
+    ratex_markets = fetch_ratex_markets(sol_price_usd=sol_price)
+    markets = exponent_markets + ratex_markets
     if not markets:
         logger.warning("Global tick: fetch returned no markets")
         return
+    logger.info(
+        "Global tick fetched %d Exponent + %d Rate-X markets",
+        len(exponent_markets),
+        len(ratex_markets),
+    )
 
     new_markets = _update_market_state(markets)
 
+    # Daily snapshot logging
+    now = time.time()
+    if now - last_snapshot_ts >= SNAPSHOT_INTERVAL:
+        try:
+            _log_snapshot(markets)
+            last_snapshot_ts = now
+        except Exception as e:
+            logger.error("Failed to log snapshot: %s", e)
+
     # Default alert: new market
     for m in new_markets:
-        label = m.get("label", m["address"][:8])
+        label = _market_display_label(m)
         text = (
             f"\U0001f195 New market listed!\n"
             f"{label}\n"
             f"PT Price: {m.get('pt_price', 0):.4f}"
         )
         await _broadcast(context, text)
+        _log_alert(
+            "new_market",
+            m.get("address"),
+            label,
+            f"PT={m.get('pt_price', 0):.4f}",
+            source=m.get("source"),
+        )
 
     # Default alert: 8% price change
     price_alerts = _detect_price_changes()
     if price_alerts:
         header = "\u26a0\ufe0f Large price movements:\n\n"
-        text = header + "\n\n".join(price_alerts)
+        text = header + "\n\n".join(a["text"] for a in price_alerts)
         await _broadcast(context, text)
+        for a in price_alerts:
+            _log_alert(
+                a["alert_type"],
+                a["address"],
+                a["label"],
+                a["detail"],
+                source=a.get("source"),
+            )
 
     # Default alert: 80% pool fill
     pool_alerts = _detect_pool_fills()
     if pool_alerts:
         header = "\U0001f4a7 Pool fill alerts:\n\n"
-        text = header + "\n\n".join(pool_alerts)
+        text = header + "\n\n".join(a["text"] for a in pool_alerts)
         await _broadcast(context, text)
+        for a in pool_alerts:
+            _log_alert(
+                a["alert_type"],
+                a["address"],
+                a["label"],
+                a["detail"],
+                source=a.get("source"),
+            )
+
+    # Cross-venue spread signals
+    if evaluate_signals is not None:
+        try:
+            signals = evaluate_signals(markets)
+            alertable = get_alertable_signals(signals)
+            if alertable:
+                header = "\U0001f4e1 Cross-venue spread alerts:\n\n"
+                text = header + "\n\n".join(format_signal_alert(s) for s in alertable)
+                await _broadcast(context, text)
+                for s in alertable:
+                    _log_alert(
+                        f"spread_{s.state.lower()}",
+                        s.pair_id,
+                        s.market_title,
+                        f"spread={s.spread_bps:+.1f}bps z={s.z:+.2f} [{','.join(s.reason_codes)}]",
+                    )
+        except Exception as e:
+            logger.error("Spread signal evaluation failed: %s", e)
 
     # Periodic dashboards
-    now = time.time()
     dashboard_text = None
 
     for chat_id in list(subscribed_chats.keys()):
@@ -737,7 +1051,8 @@ async def _global_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             if dashboard_text is None:
                 dashboard_text = format_all_markets_dashboard(markets)
             try:
-                await context.bot.send_message(chat_id=chat_id, text=dashboard_text)
+                for chunk in _split_text_chunks(dashboard_text):
+                    await context.bot.send_message(chat_id=chat_id, text=chunk)
                 last_dashboard_sent[chat_id] = now
             except Exception as e:
                 logger.warning("Failed to send dashboard to %s: %s", chat_id, e)
@@ -750,8 +1065,134 @@ async def _global_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception as e:
                 logger.warning("Failed to send user alert to %s: %s", chat_id, e)
+            _log_alert("user_alert", None, None, msg)
 
     logger.info("Global tick complete — %d markets tracked", len(markets))
+
+
+# ── Daily report ─────────────────────────────────────────────────────────────
+
+
+def _build_daily_report(markets: list[dict], signals: list | None = None) -> str:
+    """Build a concise daily yield report from current market state."""
+    active = [m for m in markets if not m.get("expired")]
+    if not active:
+        return "\U0001f4ca Daily Report — no active markets."
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = ["\U0001f4c8 Solana Yield \u2014 Daily Report", f"\U0001f552 {now}", ""]
+
+    # ── Top APY opportunities ────────────────────────────────────────────
+    with_apy = [m for m in active if m.get("implied_apy") is not None]
+    with_apy.sort(key=lambda m: m["implied_apy"], reverse=True)
+
+    lines.append("\U0001f525 Top APY Markets")
+    for m in with_apy[:8]:
+        apy = m["implied_apy"] * 100
+        pt = m.get("pt_price")
+        pt_str = f"PT {pt:.4f}" if pt is not None else ""
+        label = _market_display_label(m)
+        lines.append(f"  {apy:5.1f}%  {label}  {pt_str}")
+    lines.append("")
+
+    # ── Pool liquidity highlights ────────────────────────────────────────
+    pools = [m for m in active if m.get("pool_fill_pct") is not None]
+    pools.sort(key=lambda m: m["pool_fill_pct"], reverse=True)
+    filling = [m for m in pools if m["pool_fill_pct"] >= 0.60]
+    if filling:
+        lines.append("\U0001f4a7 Pools Above 60% Fill")
+        for m in filling[:6]:
+            fill = m["pool_fill_pct"]
+            tvl = m.get("tvl_usd")
+            cap = m.get("pool_cap_usd")
+            label = _market_display_label(m)
+            vol_str = f" \u2014 {_fmt_usd(tvl)}/{_fmt_usd(cap)}" if tvl and cap else ""
+            lines.append(f"  {fill:5.0%}  {label}{vol_str}")
+        lines.append("")
+
+    # ── TVL leaders (RTX + EXP combined) ─────────────────────────────────
+    with_tvl = [m for m in active if m.get("tvl_usd") is not None and m["tvl_usd"] > 0]
+    with_tvl.sort(key=lambda m: m["tvl_usd"], reverse=True)
+    if with_tvl:
+        lines.append("\U0001f4b0 TVL Leaders")
+        for m in with_tvl[:6]:
+            label = _market_display_label(m)
+            lines.append(f"  {_fmt_usd(m['tvl_usd']):>8}  {label}")
+        lines.append("")
+
+    # ── Cross-venue spread status ────────────────────────────────────────
+    if signals:
+        eligible_signals = [s for s in signals if s.eligible]
+        active_signals = [s for s in eligible_signals if s.state != "NO_TRIGGER"]
+        lines.append("\U0001f4e1 Cross-Venue Spreads")
+        if active_signals:
+            _emoji = {"ACT": "\U0001f534", "WATCH": "\U0001f7e1", "INFO": "\U0001f535"}
+            for s in sorted(active_signals, key=lambda x: {"ACT": 0, "WATCH": 1, "INFO": 2}.get(x.state, 3)):
+                direction = "EXP richer" if s.spread_bps > 0 else "RTX richer"
+                lines.append(
+                    f"  {_emoji.get(s.state, '')} {s.state} {s.market_title}: "
+                    f"{s.spread_bps:+.1f} bps (z={s.z:+.1f}) {direction}"
+                )
+        else:
+            lines.append("  All spreads within normal range \u2705")
+        for s in eligible_signals:
+            if s.state == "NO_TRIGGER":
+                lines.append(f"  \u26aa {s.market_title}: {s.spread_bps:+.1f} bps (z={s.z:+.1f})")
+        lines.append("")
+
+    # ── Markets expiring soon (within 30 days) ───────────────────────────
+    now_ts = time.time()
+    expiring = []
+    for m in active:
+        mat_ts = m.get("maturity_ts")
+        if mat_ts and 0 < (mat_ts - now_ts) < 30 * 86400:
+            days_left = (mat_ts - now_ts) / 86400
+            expiring.append((days_left, m))
+    expiring.sort(key=lambda x: x[0])
+    if expiring:
+        lines.append("\u23f0 Expiring Within 30 Days")
+        for days_left, m in expiring[:8]:
+            label = _market_display_label(m)
+            lines.append(f"  {days_left:4.0f}d  {label}")
+        lines.append("")
+
+    # ── Summary stats ────────────────────────────────────────────────────
+    exp_count = sum(1 for m in active if (m.get("source") or "").lower() != "ratex")
+    rtx_count = sum(1 for m in active if (m.get("source") or "").lower() == "ratex")
+    total_tvl = sum(m.get("tvl_usd", 0) for m in active if m.get("tvl_usd"))
+    lines.append(f"\u2139\ufe0f {len(active)} markets ({exp_count} EXP, {rtx_count} RTX) \u00b7 Total TVL {_fmt_usd(total_tvl)}")
+
+    return "\n".join(lines)
+
+
+async def _daily_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled job: send daily report at 10am UTC+8 (2am UTC)."""
+    logger.info("Daily report job triggered")
+
+    if all_markets_latest:
+        markets = list(all_markets_latest.values())
+    else:
+        exp = fetch_all_markets()
+        sol = next((m.get("sol_price_usd") for m in exp if m.get("sol_price_usd")), None)
+        markets = exp + fetch_ratex_markets(sol_price_usd=sol)
+        if markets:
+            _update_market_state(markets)
+
+    if not markets:
+        logger.warning("Daily report: no markets available")
+        return
+
+    signals = None
+    if evaluate_signals is not None:
+        try:
+            signals = evaluate_signals(markets)
+        except Exception as e:
+            logger.warning("Daily report: signal computation failed: %s", e)
+
+    report = _build_daily_report(markets, signals)
+    await _broadcast(context, report)
+    logger.info("Daily report sent to %d subscribers", len(subscribed_chats) + (1 if DEFAULT_CHAT_ID else 0))
 
 
 # ── Telegram command handlers ────────────────────────────────────────────────
@@ -760,20 +1201,35 @@ async def _global_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome message with usage instructions."""
     msg = (
-        "\U0001f4ca *ExponentFi Yield Monitor*\n\n"
-        "Track PT/YT/LP prices across all Exponent markets\\.\n\n"
-        "*Always\\-on alerts:*\n"
+        "\U0001f4ca *Solana Yield Monitor*\n\n"
+        "Real\\-time PT/YT tracking across "
+        "[Exponent](https://www.exponent.finance) \\& "
+        "[Rate\\-X](https://app.rate-x.io)\\.\n\n"
+        "*Auto alerts \\(always on\\):*\n"
         "\u2022 New market listings\n"
-        "\u2022 PT/YT price moves \\>8%\n"
-        "\u2022 LP pool fills \\>80%\n\n"
+        "\u2022 PT/YT price moves \\>20%\n"
+        "\u2022 LP pool fill \\>80%\n\n"
+        "*Cross\\-venue spread signals:*\n"
+        "When the same asset trades on both EXP \\& RTX, "
+        "the bot tracks the PT price gap and fires tiered alerts:\n"
+        "\U0001f534 `ACT` — statistically extreme spread \\(z \\>\\= 2\\.0\\), likely actionable\n"
+        "\U0001f7e1 `WATCH` — moderately extreme or jump detected\n"
+        "\U0001f535 `INFO` — mild dislocation, heads\\-up only\n"
+        "Signals include spread \\(bps\\), z\\-score, maturity gap class, "
+        "and basis regime \\(structural vs normal\\)\\.\n\n"
+        "*Daily report \\(10am UTC\\+8\\):*\n"
+        "Top APY markets, pool fill highlights, TVL leaders, "
+        "cross\\-venue spread status, and expiring markets\\. "
+        "Sent automatically to subscribers every morning\\.\n\n"
         "*Commands:*\n"
-        "/markets \\- All\\-markets dashboard\n"
-        "/market `<filter>` \\- Detailed view \\(e\\.g\\. /market bulk\\)\n"
-        "/setalert `<pct>` `[market]` \\- Custom % alert\n"
-        "/alerts \\- List your alerts\n"
-        "/deletealert `<id>` \\- Delete a specific alert\n"
-        "/subscribe \\- Periodic dashboards \\(10 min\\)\n"
-        "/unsubscribe \\- Stop dashboards\n"
+        "/report — Daily yield report on demand\n"
+        "/markets — All\\-markets dashboard\n"
+        "/market `filter` — Detail view \\(e\\.g\\. /market hylo\\)\n"
+        "/setalert `pct` `[market]` — Custom % alert\n"
+        "/alerts — List your alerts\n"
+        "/deletealert `id` — Remove an alert\n"
+        "/subscribe — Dashboard every 10 min \\+ all alerts\n"
+        "/unsubscribe — Stop updates\n"
     )
     await update.message.reply_text(msg, parse_mode="MarkdownV2")
 
@@ -781,16 +1237,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show all-markets dashboard. Optional filter argument."""
     await update.message.reply_text("\u23f3 Fetching data...")
+    used_snapshot_path: Path | None = None
 
     if all_markets_latest:
         markets = list(all_markets_latest.values())
     else:
-        markets = fetch_all_markets()
+        exp_markets = fetch_all_markets()
+        _sol = next((m.get("sol_price_usd") for m in exp_markets if m.get("sol_price_usd")), None)
+        markets = exp_markets + fetch_ratex_markets(sol_price_usd=_sol)
         if markets:
             _update_market_state(markets)
+        else:
+            markets, used_snapshot_path = _load_latest_snapshot_markets()
 
     if not markets:
-        await update.message.reply_text("\u274c Failed to fetch data. Try again later.")
+        await update.message.reply_text(
+            "\u274c Failed to fetch live data and no local snapshot is available."
+        )
         return
 
     # Optional filter
@@ -801,13 +1264,19 @@ async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if filt in (m.get("label") or "").lower()
             or filt in (m.get("address") or "").lower()
             or filt in (m.get("platform") or "").lower()
+            or filt in (m.get("source") or "").lower()
         ]
         if not markets:
             await update.message.reply_text(f"No markets matching '{filt}'.")
             return
 
     dashboard = format_all_markets_dashboard(markets)
-    await update.message.reply_text(dashboard)
+    for chunk in _split_text_chunks(dashboard):
+        await update.message.reply_text(chunk)
+    if used_snapshot_path:
+        await update.message.reply_text(
+            f"\u2139\ufe0f Showing cached snapshot from {used_snapshot_path.name} (live fetch unavailable)."
+        )
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -817,13 +1286,18 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     filt = " ".join(context.args).lower()
+    used_snapshot_path: Path | None = None
 
     if all_markets_latest:
         markets = list(all_markets_latest.values())
     else:
-        markets = fetch_all_markets()
+        exp_markets = fetch_all_markets()
+        _sol = next((m.get("sol_price_usd") for m in exp_markets if m.get("sol_price_usd")), None)
+        markets = exp_markets + fetch_ratex_markets(sol_price_usd=_sol)
         if markets:
             _update_market_state(markets)
+        else:
+            markets, used_snapshot_path = _load_latest_snapshot_markets()
 
     if not markets:
         await update.message.reply_text("\u274c No market data available.")
@@ -834,6 +1308,7 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if filt in (m.get("label") or "").lower()
         or filt in (m.get("address") or "").lower()
         or filt in (m.get("platform") or "").lower()
+        or filt in (m.get("source") or "").lower()
     ]
 
     if not matched:
@@ -846,6 +1321,10 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if len(matched) > 5:
         await update.message.reply_text(f"...and {len(matched) - 5} more. Use a more specific filter.")
+    if used_snapshot_path:
+        await update.message.reply_text(
+            f"\u2139\ufe0f Results are from cached snapshot {used_snapshot_path.name} (live fetch unavailable)."
+        )
 
 
 async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -896,7 +1375,7 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(
             "No active custom alerts.\n"
             "Use /setalert to add one.\n\n"
-            "Default alerts (new market, 8% price change, 80% pool fill) "
+            "Default alerts (new market, 20% price change, 80% pool fill) "
             "are always active for subscribed chats."
         )
         return
@@ -940,6 +1419,35 @@ async def cmd_deletealert(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate and send the daily report on demand."""
+    await update.message.reply_text("\u23f3 Generating report...")
+
+    if all_markets_latest:
+        markets = list(all_markets_latest.values())
+    else:
+        exp = fetch_all_markets()
+        sol = next((m.get("sol_price_usd") for m in exp if m.get("sol_price_usd")), None)
+        markets = exp + fetch_ratex_markets(sol_price_usd=sol)
+        if markets:
+            _update_market_state(markets)
+
+    if not markets:
+        await update.message.reply_text("\u274c No market data available.")
+        return
+
+    signals = None
+    if evaluate_signals is not None:
+        try:
+            signals = evaluate_signals(markets)
+        except Exception as e:
+            logger.warning("Report command: signal computation failed: %s", e)
+
+    report = _build_daily_report(markets, signals)
+    for chunk in _split_text_chunks(report):
+        await update.message.reply_text(chunk)
+
+
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Subscribe to periodic dashboards + default alerts."""
     chat_id = update.effective_chat.id
@@ -948,7 +1456,7 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(
         f"\u2705 Subscribed! Dashboards every {DEFAULT_INTERVAL_SECONDS // 60} min.\n"
-        f"Default alerts (new markets, 8% moves, 80% pool fill) are now active."
+        f"Default alerts (new markets, 20% moves, 80% pool fill) are now active."
     )
 
 
@@ -979,6 +1487,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setalert", cmd_setalert))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("deletealert", cmd_deletealert))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
 
@@ -989,7 +1498,15 @@ def main() -> None:
         name="global_tick",
     )
 
-    logger.info("ExponentFi Yield Monitor starting...")
+    # Daily report at 10:00 AM UTC+8 = 02:00 UTC
+    from datetime import time as dt_time
+    app.job_queue.run_daily(
+        _daily_report_job,
+        time=dt_time(hour=2, minute=0, second=0, tzinfo=timezone.utc),
+        name="daily_report",
+    )
+
+    logger.info("Solana Yield Monitor starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
